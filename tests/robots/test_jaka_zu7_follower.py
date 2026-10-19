@@ -1,3 +1,4 @@
+import json
 import math
 from unittest.mock import MagicMock
 
@@ -7,47 +8,52 @@ from lerobot.robots.jaka_zu7_follower import JAKAZu7Follower, JAKAZu7FollowerCon
 from lerobot.robots.jaka_zu7_follower.jaka_zu7_follower import JAKA_ZU7_JOINTS, _limit_joint_step
 
 
-class FakeJakaRobot:
-    def __init__(self, *_args):
-        self.joints_rad = [0.0] * 6
-        self.servo_mode = False
-        self.servo_commands = []
+class FakeSocket:
+    """让 connect() 不真的建立 socket 连接。"""
 
-    def login(self):
-        return (0,)
+    def settimeout(self, _timeout):
+        pass
 
-    def logout(self):
-        return (0,)
+    def makefile(self, _mode):
+        return MagicMock()
 
-    def get_joint_position(self):
-        return (0, self.joints_rad)
+    def sendall(self, _data):
+        pass
 
-    def servo_move_enable(self, enable):
-        self.servo_mode = enable
-        return (0,)
-
-    def servo_j_extend(self, joints_rad, move_mode, step_num):
-        self.servo_commands.append((joints_rad, move_mode, step_num))
-        return (0,)
+    def close(self):
+        pass
 
 
 @pytest.fixture
 def robot(tmp_path, monkeypatch):
-    fake_jaka = FakeJakaRobot()
-    sdk_module = MagicMock(RC=MagicMock(return_value=fake_jaka))
     monkeypatch.setattr(
-        "lerobot.robots.jaka_zu7_follower.jaka_zu7_follower.importlib.import_module",
-        lambda _name: sdk_module,
+        "lerobot.robots.jaka_zu7_follower.jaka_zu7_follower.socket.create_connection",
+        lambda *_args, **_kwargs: FakeSocket(),
     )
     config = JAKAZu7FollowerConfig(
-        ip_address="192.168.1.10",
         calibration_dir=tmp_path,
         max_joint_velocity_deg_s=1000,
         max_joint_acceleration_deg_s2=1000,
     )
     instance = JAKAZu7Follower(config)
+
+    state = {"joints_deg": [0.0] * 6, "sent": [], "fail_set": False}
+
+    def fake_request(req):
+        if req["cmd"] == "get":
+            return {"joints": list(state["joints_deg"])}
+        if req["cmd"] == "set":
+            if state["fail_set"]:
+                raise RuntimeError("JAKA bridge error: servo_j 错误码 -3")
+            state["sent"].append(req["joints"])
+            return {"status": "ok"}
+        if req["cmd"] == "exit":
+            return {"status": "bye"}
+        raise AssertionError(f"unexpected cmd {req}")
+
+    monkeypatch.setattr(instance, "_request", fake_request)
     instance.connect()
-    yield instance, fake_jaka
+    yield instance, state
     if instance.is_connected:
         instance.disconnect()
 
@@ -61,8 +67,8 @@ def test_features_match_six_so_arm101_arm_joints(robot):
 
 
 def test_feedback_is_reported_in_degrees(robot):
-    instance, fake_jaka = robot
-    fake_jaka.joints_rad = [0, math.pi / 2, math.pi, -math.pi / 2, 0, 0]
+    instance, state = robot
+    state["joints_deg"] = [0, 90, 180, -90, 0, 0]
 
     observation = instance.get_observation()
 
@@ -73,33 +79,30 @@ def test_feedback_is_reported_in_degrees(robot):
 
 
 def test_joint_signs_and_offsets_map_between_leader_and_jaka(robot):
-    instance, fake_jaka = robot
+    instance, state = robot
     instance.config.joint_signs = (-1, 1, 1, 1, 1, 1)
     instance.config.joint_offsets_deg = (10, 0, 0, 0, 0, 0)
-    fake_jaka.joints_rad = [math.radians(10), 0, 0, 0, 0, 0]
+    state["joints_deg"] = [10, 0, 0, 0, 0, 0]
 
     observation = instance.get_observation()
     assert observation["shoulder_pan.pos"] == pytest.approx(0)
 
     action = {f"{joint}.pos": 0.0 for joint in JAKA_ZU7_JOINTS}
     instance.send_action(action)
-    commanded_rad = fake_jaka.servo_commands[-1][0]
-    assert commanded_rad[0] == pytest.approx(math.radians(10))
+    assert state["sent"][-1][0] == pytest.approx(10)
 
 
 def test_send_action_uses_joint_order_and_ignores_leader_gripper(robot):
-    instance, fake_jaka = robot
+    instance, state = robot
     action = {f"{joint}.pos": 10.0 for joint in JAKA_ZU7_JOINTS}
     action["gripper.pos"] = 75.0
 
     sent = instance.send_action(action)
 
     assert list(sent) == [f"{joint}.pos" for joint in JAKA_ZU7_JOINTS]
-    assert len(fake_jaka.servo_commands) == 1
-    joints_rad, move_mode, step_num = fake_jaka.servo_commands[0]
-    assert move_mode == 0
-    assert step_num == 2
-    assert joints_rad == pytest.approx([math.radians(sent[f"{joint}.pos"]) for joint in JAKA_ZU7_JOINTS])
+    assert len(state["sent"]) == 1
+    assert len(state["sent"][0]) == 6
+    # 软限速:第一步到不了 10
     assert max(abs(value) for value in sent.values()) < 10.0
 
 
@@ -114,23 +117,20 @@ def test_send_action_rejects_missing_and_unknown_joints(robot):
         instance.send_action(action)
 
 
-def test_sdk_failure_is_reported(robot):
-    instance, fake_jaka = robot
-    fake_jaka.servo_j_extend = MagicMock(return_value=(-3,))
+def test_bridge_error_is_reported(robot):
+    instance, state = robot
+    state["fail_set"] = True
     action = {f"{joint}.pos": 0.0 for joint in JAKA_ZU7_JOINTS}
 
-    with pytest.raises(RuntimeError, match="servo_j_extend.*-3"):
+    with pytest.raises(RuntimeError, match="servo_j"):
         instance.send_action(action)
-    assert instance._command_position_deg == [0.0] * 6
-    assert instance._command_velocity_deg_s == [0.0] * 6
 
 
-def test_disconnect_exits_servo_mode(robot):
-    instance, fake_jaka = robot
+def test_disconnect_sends_exit(robot):
+    instance, _ = robot
 
     instance.disconnect()
 
-    assert not fake_jaka.servo_mode
     assert not instance.is_connected
 
 
@@ -146,3 +146,24 @@ def test_limit_joint_step_bounds_velocity_and_acceleration():
 
     assert velocity == pytest.approx([0.1])
     assert position == pytest.approx([0.001])
+
+
+def test_request_raises_on_bridge_error():
+    # 直接测真实的 _request:当 bridge 返回 {"status":"error"} 时必须抛 RuntimeError。
+    class _ErrorFile:
+        def readline(self):
+            return json.dumps({"status": "error", "error": "servo_j 错误码 -3"}).encode("utf-8") + b"\n"
+
+    class _ErrorSocket:
+        def sendall(self, _data):
+            pass
+
+        def makefile(self, _mode):
+            return _ErrorFile()
+
+    instance = JAKAZu7Follower(JAKAZu7FollowerConfig(calibration_dir=None))
+    instance._sock = _ErrorSocket()
+    instance._recv_file = instance._sock.makefile("rb")
+
+    with pytest.raises(RuntimeError, match="servo_j"):
+        instance._request({"cmd": "set", "joints": [0.0] * 6})

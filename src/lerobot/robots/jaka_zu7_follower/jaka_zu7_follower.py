@@ -1,9 +1,9 @@
-import importlib
+import json
 import logging
 import math
+import socket
 import time
 from functools import cached_property
-from typing import Any
 
 from lerobot.cameras import DepthCamera, make_cameras_from_configs
 from lerobot.lerobot_types import RobotAction, RobotObservation
@@ -15,6 +15,7 @@ from .config_jaka_zu7_follower import JAKAZu7FollowerConfig
 logger = logging.getLogger(__name__)
 
 # Keep these keys identical to the six arm joints in this project's SO-ARM101 leader.
+# They map 1:1 to JAKA J1..J6 (signs/offsets are applied in send_action/_read_joints_deg).
 JAKA_ZU7_JOINTS = (
     "shoulder_pan",
     "heavy_joint",
@@ -23,7 +24,11 @@ JAKA_ZU7_JOINTS = (
     "wrist_flex",
     "wrist_roll",
 )
-JAKA_SERVO_PERIOD_S = 0.008
+
+_SOCKET_TIMEOUT_S = 5.0
+# Software velocity/acceleration limiter dt ceiling: matches one 60 Hz teleop cycle.
+# Prevents a large step when send_action has not been called for a while.
+_CONTROL_DT_MAX_S = 0.016
 
 
 def _limit_joint_step(
@@ -56,7 +61,14 @@ def _limit_joint_step(
 
 
 class JAKAZu7Follower(Robot):
-    """LeRobot follower driver for the six-axis JAKA Zu 7."""
+    """LeRobot follower driver for the six-axis JAKA Zu 7, via the bridge server.
+
+    The JAKA ``jkrc`` SDK only works on Python <= 3.10 while LeRobot requires >= 3.12,
+    so this class does NOT import ``jkrc``. Instead it is a socket client to
+    ``jaka_bridge_server.py`` (a Python 3.10 process that owns the SDK). Positions are
+    expressed in **degrees** at the LeRobot boundary; the bridge server converts
+    deg <-> rad at the SDK boundary.
+    """
 
     config_class = JAKAZu7FollowerConfig
     name = "jaka_zu7_follower"
@@ -64,9 +76,8 @@ class JAKAZu7Follower(Robot):
     def __init__(self, config: JAKAZu7FollowerConfig):
         super().__init__(config)
         self.config = config
-        self._sdk: Any | None = None
-        self._logged_in = False
-        self._servo_mode_enabled = False
+        self._sock: socket.socket | None = None
+        self._recv_file = None
         self._connected = False
         self._command_position_deg: list[float] | None = None
         self._command_velocity_deg_s = [0.0] * len(JAKA_ZU7_JOINTS)
@@ -104,40 +115,29 @@ class JAKAZu7Follower(Robot):
     @check_if_already_connected
     def connect(self, calibrate: bool = False) -> None:
         try:
-            try:
-                sdk_module = importlib.import_module("jkrc")
-            except ImportError as exc:
-                raise ImportError(
-                    "Could not import the JAKA Python SDK module 'jkrc'. Add the SDK's Linux Python 3 x86_64 "
-                    "directory to PYTHONPATH and its directory containing libjakaAPI.so to LD_LIBRARY_PATH. "
-                    "The SDK binary must be compatible with this Python installation."
-                ) from exc
-
-            self._sdk = sdk_module.RC(self.config.ip_address)
-            self._check_sdk_result(self._sdk.login(), "login")
-            self._logged_in = True
-
-            if self.config.auto_power_on:
-                self._check_sdk_result(self._sdk.power_on(), "power_on")
-                time.sleep(self.config.power_on_delay_s)
-            if self.config.auto_enable_robot:
-                self._check_sdk_result(self._sdk.enable_robot(), "enable_robot")
-
+            self._sock = socket.create_connection(
+                (self.config.bridge_host, self.config.bridge_port), timeout=_SOCKET_TIMEOUT_S
+            )
+            self._sock.settimeout(_SOCKET_TIMEOUT_S)
+            self._recv_file = self._sock.makefile("rb")
+            # Read the initial position once: confirms the bridge is live and seeds
+            # the software velocity limiter.
             self._command_position_deg = self._read_joints_deg()
-            self._check_sdk_result(self._sdk.servo_move_enable(True), "servo_move_enable(True)")
-            self._servo_mode_enabled = True
             self._last_command_time = time.monotonic()
             self._connected = True
 
             for camera in self.cameras.values():
                 camera.connect()
 
-            logger.info("%s connected to JAKA controller at %s", self, self.config.ip_address)
+            logger.info(
+                "%s connected to JAKA bridge at %s:%s",
+                self, self.config.bridge_host, self.config.bridge_port,
+            )
         except Exception:
             try:
                 self.disconnect()
             except Exception:
-                logger.exception("Cleanup failed after JAKA connection error")
+                logger.exception("Cleanup failed after JAKA bridge connection error")
             raise
 
     @check_if_not_connected
@@ -172,10 +172,12 @@ class JAKAZu7Follower(Robot):
 
         if self._command_position_deg is None:
             raise RuntimeError("JAKA follower has no initial joint position")
+
         now = time.monotonic()
-        servo_window_s = self.config.servo_step_num * JAKA_SERVO_PERIOD_S
-        elapsed_s = servo_window_s if self._last_command_time is None else now - self._last_command_time
-        dt = max(0.001, min(elapsed_s, servo_window_s))
+        if self._last_command_time is None:
+            dt = _CONTROL_DT_MAX_S
+        else:
+            dt = max(0.001, min(now - self._last_command_time, _CONTROL_DT_MAX_S))
 
         command_deg, command_velocity_deg_s = _limit_joint_step(
             position=self._command_position_deg,
@@ -191,18 +193,15 @@ class JAKAZu7Follower(Robot):
                 self.config.joint_signs, self.config.joint_offsets_deg, command_deg, strict=True
             )
         ]
-        command_rad = [math.radians(value) for value in controller_command_deg]
-        sdk = self._require_sdk()
-        self._check_sdk_result(
-            sdk.servo_j_extend(command_rad, 0, self.config.servo_step_num),
-            "servo_j_extend",
-        )
+
+        self._request({"cmd": "set", "joints": controller_command_deg})
+
         self._command_position_deg = command_deg
         self._command_velocity_deg_s = command_velocity_deg_s
         self._last_command_time = now
 
         if "gripper.pos" in action:
-            logger.debug("Ignoring SO-ARM101 leader gripper action; this JAKA setup has no gripper mapping")
+            logger.debug("Ignoring SO-ARM101 leader gripper action; no JAKA gripper mapping")
 
         return {f"{joint}.pos": value for joint, value in zip(JAKA_ZU7_JOINTS, command_deg, strict=True)}
 
@@ -215,21 +214,25 @@ class JAKAZu7Follower(Robot):
             except Exception as exc:
                 first_error = first_error or exc
 
-        if self._sdk is not None:
-            if self._servo_mode_enabled:
-                try:
-                    self._check_sdk_result(self._sdk.servo_move_enable(False), "servo_move_enable(False)")
-                except Exception as exc:
-                    first_error = first_error or exc
-                self._servo_mode_enabled = False
-            if self._logged_in:
-                try:
-                    self._check_sdk_result(self._sdk.logout(), "logout")
-                except Exception as exc:
-                    first_error = first_error or exc
-                self._logged_in = False
+        if self._sock is not None and self._recv_file is not None:
+            try:
+                self._request({"cmd": "exit"})
+            except Exception as exc:
+                first_error = first_error or exc
 
-        self._sdk = None
+        if self._recv_file is not None:
+            try:
+                self._recv_file.close()
+            except Exception:
+                pass
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+
+        self._sock = None
+        self._recv_file = None
         self._connected = False
         self._command_position_deg = None
         self._last_command_time = None
@@ -238,14 +241,13 @@ class JAKAZu7Follower(Robot):
             raise RuntimeError(f"Error while disconnecting {self}") from first_error
 
     def _read_joints_deg(self) -> list[float]:
-        result = self._require_sdk().get_joint_position()
-        self._check_sdk_result(result, "get_joint_position")
-        if len(result) < 2 or len(result[1]) != len(JAKA_ZU7_JOINTS):
-            raise RuntimeError("JAKA get_joint_position returned an unexpected joint vector")
-        joints_rad = [float(value) for value in result[1]]
-        if not all(math.isfinite(value) for value in joints_rad):
-            raise RuntimeError("JAKA get_joint_position returned non-finite joint values")
-        joints_deg = [math.degrees(value) for value in joints_rad]
+        resp = self._request({"cmd": "get"})
+        joints_deg = resp.get("joints")
+        if not isinstance(joints_deg, (list, tuple)) or len(joints_deg) != len(JAKA_ZU7_JOINTS):
+            raise RuntimeError("JAKA bridge returned an unexpected joint vector")
+        joints_deg = [float(value) for value in joints_deg]
+        if not all(math.isfinite(value) for value in joints_deg):
+            raise RuntimeError("JAKA bridge returned non-finite joint values")
         return [
             (value - offset) / sign
             for sign, offset, value in zip(
@@ -253,13 +255,18 @@ class JAKAZu7Follower(Robot):
             )
         ]
 
-    def _require_sdk(self) -> Any:
-        if self._sdk is None:
-            raise RuntimeError("JAKA SDK is not connected")
-        return self._sdk
+    def _request(self, req: dict) -> dict:
+        sock = self._require_sock()
+        sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        line = self._recv_file.readline()
+        if not line:
+            raise RuntimeError("JAKA bridge connection closed by server")
+        resp = json.loads(line.decode("utf-8"))
+        if resp.get("status") == "error":
+            raise RuntimeError(f"JAKA bridge error: {resp.get('error')}")
+        return resp
 
-    @staticmethod
-    def _check_sdk_result(result: Any, operation: str) -> None:
-        if not isinstance(result, tuple | list) or not result or result[0] != 0:
-            code = result[0] if isinstance(result, tuple | list) and result else result
-            raise RuntimeError(f"JAKA SDK call {operation} failed with return value {code!r}")
+    def _require_sock(self) -> socket.socket:
+        if self._sock is None:
+            raise RuntimeError("JAKA bridge is not connected")
+        return self._sock
