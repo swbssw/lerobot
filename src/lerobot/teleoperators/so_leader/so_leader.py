@@ -73,8 +73,9 @@ class SOLeader(Teleoperator):
                 # 官方原有的其余关节（名字保持原样不变）
                 "shoulder_lift": Motor(3, "sts3215", norm_mode_body),
                 "elbow_flex": Motor(4, "sts3215", norm_mode_body),
-                "wrist_flex": Motor(5, "sts3215", norm_mode_body),
-                "wrist_roll": Motor(6, "sts3215", norm_mode_body),
+                # 机械装反:腕部两舵机物理互换,故 wrist_flex 用 ID 6、wrist_roll 用 ID 5
+                "wrist_flex": Motor(6, "sts3215", norm_mode_body),
+                "wrist_roll": Motor(5, "sts3215", norm_mode_body),
                 
                 # 你的夹爪，指定 ID 为 7
                 "gripper": Motor(7, "sts3215", MotorNormMode.RANGE_0_100),

@@ -26,6 +26,9 @@ class FakeJakaRobot:
         self.servo_mode = enable
         return (0,)
 
+    def servo_move_use_none_filter(self):
+        return (0,)
+
     def servo_j_extend(self, joints_rad, move_mode, step_num):
         self.servo_commands.append((joints_rad, move_mode, step_num))
         return (0,)
@@ -146,3 +149,67 @@ def test_limit_joint_step_bounds_velocity_and_acceleration():
 
     assert velocity == pytest.approx([0.1])
     assert position == pytest.approx([0.001])
+
+
+def test_servo_j_path_uses_reference_repository_api(robot):
+    instance, fake_jaka = robot
+    instance.config.servo_api = "servo_j"
+    instance.config.servo_step_num = 1
+    fake_jaka.servo_j = MagicMock(return_value=(0,))
+    instance.send_action(dict.fromkeys(instance.action_features, 0.0))
+    fake_jaka.servo_j.assert_called_once_with([0.0] * 6, 0)
+    assert fake_jaka.servo_commands == []
+
+
+def test_relative_start_holds_current_pose_before_following_leader_deltas(robot):
+    instance, fake_jaka = robot
+    instance.config.relative_start = True
+    # Arbitrary calibrated leader angles must not cause a startup catch-up move.
+    instance.send_action(dict.fromkeys(instance.action_features, 40.0))
+    assert fake_jaka.servo_commands[-1][0] == pytest.approx([0.0] * 6)
+    instance.send_action(dict.fromkeys(instance.action_features, 41.0))
+    assert all(value > 0 for value in fake_jaka.servo_commands[-1][0])
+
+
+def test_nlf_failure_does_not_enter_servo_mode(robot):
+    instance, fake_jaka = robot
+    instance.disconnect()
+    instance.config.configure_servo_nlf = True
+    fake_jaka.servo_move_use_joint_NLF = MagicMock(return_value=(-3,))
+    fake_jaka.servo_move_enable = MagicMock(return_value=(0,))
+    with pytest.raises(RuntimeError, match="servo_move_use_joint_NLF.*-3"):
+        instance.connect()
+    fake_jaka.servo_move_enable.assert_not_called()
+    assert not instance.is_connected
+
+
+def test_relative_start_preserves_nonzero_pose_and_joint_signs(robot):
+    instance, fake_jaka = robot
+    instance.disconnect()
+    instance.config.relative_start = True
+    instance.config.joint_offsets_deg = (0, 90, 0, 90, 180, 0)
+    instance.config.joint_signs = (-1, 1, 1, 1, 1, 1)
+    angles = [5, 90, 10, 90, 180, -5]
+    fake_jaka.joints_rad = [math.radians(value) for value in angles]
+    instance.connect()
+    first = dict.fromkeys(instance.action_features, 40.0)
+    instance.send_action(first)
+    assert fake_jaka.servo_commands[-1][0] == pytest.approx(fake_jaka.joints_rad)
+    instance.send_action({key: value + 1 for key, value in first.items()})
+    commanded = [math.degrees(value) for value in fake_jaka.servo_commands[-1][0]]
+    assert commanded[0] < angles[0]
+    assert all(value > angle for value, angle in zip(commanded[1:], angles[1:], strict=True))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"servo_api": "unknown"},
+        {"servo_api": "servo_j", "servo_step_num": 2},
+        {"max_joint_jerk_deg_s3": 0},
+        {"max_joint_jerk_deg_s3": float("nan")},
+    ],
+)
+def test_invalid_servo_configuration_is_rejected(kwargs):
+    with pytest.raises(ValueError):
+        JAKAZu7FollowerConfig(ip_address="10.5.5.100", **kwargs)
